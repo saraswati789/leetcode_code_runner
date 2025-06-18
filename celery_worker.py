@@ -1,161 +1,320 @@
-import os
+# celery_worker.py
+import subprocess
 import tempfile
+import os
 import shutil
 import time
-import subprocess
-import logging
-
 from celery import Celery
+from typing import Dict, Any, Optional, List # Added List
+import logging
+from pydantic import BaseModel
 
-# Configure logging (can be adjusted for less verbosity if needed later)
-logging.basicConfig(level=logging.INFO) # Changed to INFO for less clutter during normal operation
-logging.getLogger('celery').setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
-# Initialize Celery app
-# Using Redis as both broker and backend
-# RENAMED from 'app' to 'celery_app' to match import in main.py
-celery_app = Celery('celery_worker',
-             broker='redis://localhost:6377/0',
-             backend='redis://localhost:6377/0')
+# Celery configuration
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://localhost:6377/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://localhost:6377/0')
+
+celery_app = Celery(
+    'code_runner',
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND
+)
 
 celery_app.conf.update(
     task_track_started=True,
-    task_acks_late=True, # Acknowledge task only after it's completed
-    worker_prefetch_multiplier=1, # Process one task at a time
-    task_serializer='json',
-    result_serializer='json',
-    accept_content=['json'],
-    timezone='Asia/Kolkata', # Set your timezone
-    enable_utc=True,
+    task_time_limit=30, # Increased timeout for more complex code/multiple test cases
+    task_soft_time_limit=25,
+    broker_connection_retry_on_startup=True,
+    # Configure serializer to support Pydantic model serialization if needed,
+    # but dicts are usually fine.
+    # task_serializer='json',
+    # result_serializer='json',
+    # accept_content=['json'],
 )
 
-# --- Docker execution configuration ---
-# Define configurations for different languages.
-# Make sure these images are available locally or on Docker Hub.
-# The `command` assumes the code file will be mounted at /usr/src/app/main.<extension>
-language_configs = {
+# Language-specific Docker image and command configurations
+# Make sure these images are available or can be pulled by your Docker daemon
+LANGUAGE_CONFIGS = {
     "python": {
-        "image": "python:3.9-slim-buster", # Or your custom Python image
-        "file_extension": "py",
-        "command": "python /usr/src/app/main.py", # Full path inside container
-        "timeout": 30 # seconds
+        "image": "python:3.9-slim-buster",
+        "command": ["python", "main.py"],
+        "filename": "main.py"
     },
-    "java": {
-        "image": "openjdk:17-jdk-slim", # Or your custom Java image
-        "file_extension": "java",
-        # Compile and then run. Assumes main class is `main`
-        "command": "javac /usr/src/app/main.java && java -cp /usr/src/app main",
-        "timeout": 30 # seconds
-    },
-    "javascript": {
-        "image": "node:18-slim", # Or your custom Node.js image
-        "file_extension": "js",
-        "command": "node /usr/src/app/main.js",
-        "timeout": 30 # seconds
-    },
-    # Add more languages as needed
+    # "java": {
+    #     "image": "openjdk:17-jdk-slim",
+    #     "command": ["java", "Main"],
+    #     "filename": "Main.java"
+    # },
+    # "cpp": {
+    #     "image": "gcc:latest",
+    #     "command": ["bash", "-c", "g++ main.cpp -o main && ./main"],
+    #     "filename": "main.cpp"
+    # }
 }
 
-# --- Celery Task for Code Execution ---
-@celery_app.task(bind=True) # Use celery_app.task decorator
-def run_code_in_docker(self, language: str, code: str):
-    self.request.max_retries = 3 # Max retries for the task
-    self.request.countdown = 2   # Initial delay before retrying
+# --- Re-defining the Pydantic models needed by the worker ---
+# It's good practice to have these models available where they are consumed/produced
+# In a larger project, these would be in a shared 'models.py' file.
+class TestCase(BaseModel):
+    input: str
+    expected_output: str
 
-    if language not in language_configs:
-        return {"status": "error", "output": "", "error": "Unsupported language.", "execution_time": None}
+class TestCaseResult(BaseModel):
+    test_case_number: int
+    input: str
+    expected_output: str
+    actual_output: str
+    passed: bool
+    error: Optional[str] = None
 
-    language_config = language_configs[language]
-    temp_dir = None # Initialize temp_dir to ensure it's always defined for finally block
+class CodeExecutionResult(BaseModel):
+    status: str # "success", "compilation_error", "runtime_error", "timeout", "worker_error"
+    overall_passed: Optional[bool] = None
+    output: Optional[str] = None # Overall output (e.g., for simple prints without test cases) or aggregated errors
+    error: Optional[str] = None # Overall error (e.g., compilation error, general worker error)
+    execution_time: Optional[float] = None
+    test_results: Optional[List[TestCaseResult]] = None
+
+
+@celery_app.task(bind=True, default_retry_delay=5, max_retries=3) # Bind=True to access self for retry
+def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List[Dict[str, str]]] = None):
+    """
+    Executes user code in a Docker container with provided test cases.
+    Returns a CodeExecutionResult object.
+    """
+    config = LANGUAGE_CONFIGS.get(language)
+    if not config:
+        return CodeExecutionResult(
+            status="worker_error",
+            error=f"Unsupported language: {language}",
+            overall_passed=False
+        ).dict()
+
+    temp_dir = None
+    start_time = time.time()
+    all_test_results: List[TestCaseResult] = []
+    overall_status = "success"
+    overall_passed_flag = True
+    overall_error_message = None
 
     try:
-        # Create a temporary directory to store the code file
-        # This directory will be mounted into the Docker container.
-        temp_dir = tempfile.mkdtemp(prefix="code_runner_")
-        temp_file_name = f"main.{language_config['file_extension']}"
-        temp_file_path_in_host = os.path.join(temp_dir, temp_file_name)
-
-        # Write the user's code to the temporary file
-        with open(temp_file_path_in_host, 'w') as f:
+        temp_dir = tempfile.mkdtemp()
+        file_path = os.path.join(temp_dir, config["filename"])
+        with open(file_path, "w") as f:
             f.write(code)
 
-        # Construct the `docker run` command as a list of arguments
-        docker_command = [
-            "docker", "run",
-            "--rm", # Automatically remove the container when it exits
-            "-v", f"{temp_dir}:/usr/src/app:ro", # Mount the temporary directory read-only to /usr/src/app inside container
-            language_config['image'], # The Docker image to use (e.g., python:3.9-slim-buster)
-            "sh", "-c", language_config['command'] # Execute the specified command inside the container via sh
-        ]
+        docker_image = config["image"]
+        base_docker_command = [
+            "docker", "run", "--rm",
+            "-v", f"{temp_dir}:/app", # Mount the temp directory
+            "-w", "/app",             # Set working directory inside container
+            docker_image
+        ] + config["command"]
 
-        logging.info(f"Executing Docker command: {' '.join(docker_command)}")
-
-        start_time = time.time()
-        # Execute the command using subprocess.run
-        result = subprocess.run(
-            docker_command,
-            capture_output=True, # Capture stdout and stderr
-            text=True,           # Decode stdout/stderr as text
-            timeout=language_config['timeout'], # Set a timeout for the Docker process
-        )
-        end_time = time.time()
-        execution_time = end_time - start_time
-
-        output = result.stdout.strip()
-        error = result.stderr.strip() if result.stderr else None
-
-        # Determine overall status based on Docker command's exit code
-        status = "success"
-        if result.returncode != 0:
-            status = "error"
-            if not error: # If no stderr, but non-zero exit, use a generic error message
-                error = f"Process exited with non-zero status code: {result.returncode}. Output: {output}"
-
-        logging.info(f"Code execution finished. Status: {status}, Time: {execution_time:.2f}s")
-        if output:
-            logging.info(f"Output:\n{output}")
-        if error:
-            logging.error(f"Error:\n{error}")
-
-        return {
-            "status": status,
-            "output": output,
-            "error": error,
-            "execution_time": execution_time
-        }
-
-    except subprocess.TimeoutExpired:
-        # Handle cases where the Docker command times out
-        logging.error(f"Execution timed out for task {self.request.id} after {language_config['timeout']} seconds.")
-        raise self.retry(
-            exc=subprocess.TimeoutExpired(cmd=docker_command, timeout=language_config['timeout']),
-            countdown=self.request.countdown * 2 # Exponential backoff for retries
-        )
-    except FileNotFoundError:
-        # This typically means the 'docker' command itself was not found in PATH
-        logging.critical("Docker command not found. Is Docker installed and in your PATH?")
-        return {
-            "status": "error",
-            "output": "",
-            "error": "Docker CLI not found. Please ensure Docker is installed and accessible in the system's PATH.",
-            "execution_time": None
-        }
-    except Exception as e:
-        # Catch any other unexpected errors during the process
-        logging.error(f"An unexpected error occurred for task {self.request.id}: {str(e)}")
-        raise self.retry(
-            exc=e,
-            countdown=self.request.countdown * 2
-        )
-    finally:
-        # Ensure the temporary directory is cleaned up
-        if temp_dir and os.path.exists(temp_dir):
+        # If no specific test cases provided, run once without stdin, capture stdout/stderr
+        if not test_cases:
             try:
-                shutil.rmtree(temp_dir)
-                logging.info(f"Cleaned up temporary directory: {temp_dir}")
-            except Exception as e:
-                logging.error(f"Error cleaning up temporary directory {temp_dir}: {e}")
+                logging.info(f"Running code without specific test cases for {language}...")
+                process = subprocess.run(
+                    base_docker_command,
+                    capture_output=True,
+                    text=True,
+                    check=False, # Do not raise CalledProcessError automatically
+                    timeout=celery_app.conf.task_time_limit # Use Celery's task timeout
+                )
+                actual_output = process.stdout.strip()
+                error_output = process.stderr.strip()
 
-# This ensures the Celery app is available for the worker to discover tasks
-if __name__ == '__main__':
-    celery_app.worker_main(['worker', '-l', 'info', '--concurrency=1']) # Use celery_app here
+                if process.returncode != 0:
+                    overall_status = "runtime_error" if process.returncode else "compilation_error"
+                    overall_error_message = error_output if error_output else f"Process exited with non-zero code {process.returncode}."
+                    overall_passed_flag = False
+                elif error_output: # Warnings or other stderr output not causing exit code
+                    overall_error_message = error_output
+
+                execution_time = time.time() - start_time
+                return CodeExecutionResult(
+                    status=overall_status,
+                    overall_passed=overall_passed_flag,
+                    output=actual_output,
+                    error=overall_error_message,
+                    execution_time=execution_time,
+                    test_results=[] # No test results for this mode
+                ).dict()
+
+            except subprocess.TimeoutExpired:
+                overall_status = "timeout"
+                overall_error_message = "Code execution timed out."
+                overall_passed_flag = False
+                # Try to kill the process if it's still running
+                if process.poll() is None:
+                    process.kill()
+                # Retry the task if it timed out - this is where bind=True and self.retry() come in
+                # self.retry(exc=subprocess.TimeoutExpired("Code execution timed out."), countdown=5)
+                # For now, just return a result, but retrying is a valid strategy
+                execution_time = time.time() - start_time
+                return CodeExecutionResult(
+                    status=overall_status,
+                    overall_passed=overall_passed_flag,
+                    output="",
+                    error=overall_error_message,
+                    execution_time=execution_time
+                ).dict()
+            except Exception as e:
+                overall_status = "worker_error"
+                overall_error_message = f"An unexpected error occurred during execution: {str(e)}"
+                overall_passed_flag = False
+                execution_time = time.time() - start_time
+                return CodeExecutionResult(
+                    status=overall_status,
+                    overall_passed=overall_passed_flag,
+                    output="",
+                    error=overall_error_message,
+                    execution_time=execution_time
+                ).dict()
+
+
+        # --- Execute with Test Cases ---
+        logging.info(f"Running code with {len(test_cases)} test cases for {language}...")
+        for i, test_case_dict in enumerate(test_cases):
+            test_case = TestCase(**test_case_dict) # Convert dict to Pydantic model for type safety
+            test_case_number = i + 1
+            passed = False
+            test_case_error = None
+
+            try:
+                process = subprocess.run(
+                    base_docker_command,
+                    input=test_case.input + '\n',
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=celery_app.conf.task_time_limit # Use Celery's task timeout
+                )
+
+                actual_output = process.stdout.strip()
+                error_output = process.stderr.strip()
+
+                if process.returncode != 0:
+                    test_case_error = error_output if error_output else f"Runtime error: exited with code {process.returncode}"
+                    overall_status = "runtime_error" # Update overall status if any test case fails due to runtime
+                    overall_passed_flag = False
+                elif error_output:
+                    # Capture stderr even if return code is 0 (e.g., warnings or Python tracebacks)
+                    test_case_error = error_output
+                    # If stderr is present, it's typically a failure for a judge
+                    overall_status = "runtime_error" # Treat stderr as a failure for overall status
+                    overall_passed_flag = False
+
+                # Compare output, ignoring leading/trailing whitespace and ensuring consistent line endings
+                if not test_case_error and actual_output.replace('\r\n', '\n') == test_case.expected_output.strip().replace('\r\n', '\n'):
+                    passed = True
+                else:
+                    passed = False
+                    overall_passed_flag = False # If any test case fails, overall fails
+
+                all_test_results.append(
+                    TestCaseResult(
+                        test_case_number=test_case_number,
+                        input=test_case.input + '\n',
+                        expected_output=test_case.expected_output,
+                        actual_output=actual_output,
+                        passed=passed,
+                        error=test_case_error
+                    )
+                )
+
+            except subprocess.TimeoutExpired:
+                test_case_error = "Code execution timed out for this test case."
+                all_test_results.append(
+                    TestCaseResult(
+                        test_case_number=test_case_number,
+                        input=test_case.input + '\n',
+                        expected_output=test_case.expected_output,
+                        actual_output="",
+                        passed=False,
+                        error=test_case_error
+                    )
+                )
+                overall_status = "timeout"
+                overall_passed_flag = False
+                # Continue processing other test cases or raise/retry?
+                # For now, we collect all results and report overall timeout if any occurred.
+                logging.warning(f"Timeout on test case {test_case_number} for task {self.request.id}")
+            except Exception as e:
+                test_case_error = f"Worker error during test case {test_case_number}: {str(e)}"
+                all_test_results.append(
+                    TestCaseResult(
+                        test_case_number=test_case_number,
+                        input=test_case.input + '\n',
+                        expected_output=test_case.expected_output,
+                        actual_output="",
+                        passed=False,
+                        error=test_case_error
+                    )
+                )
+                overall_status = "worker_error"
+                overall_passed_flag = False
+                logging.exception(f"Unhandled error on test case {test_case_number} for task {self.request.id}")
+                # Don't re-raise immediately, collect results and return.
+
+        execution_time = time.time() - start_time
+
+        # Determine final overall status
+        if overall_status == "success" and not overall_passed_flag:
+            overall_status = "failure" # This can happen if all test cases ran but some failed comparisons
+
+        return CodeExecutionResult(
+            status=overall_status,
+            overall_passed=overall_passed_flag,
+            output="\n".join([r.actual_output for r in all_test_results]), # Aggregate all outputs
+            error=overall_error_message, # Use the first overall error or aggregate
+            execution_time=execution_time,
+            test_results=all_test_results
+        ).dict() # Convert Pydantic model to dict for Celery result backend
+
+    except subprocess.CalledProcessError as e:
+        overall_status = "compilation_error" # Or sometimes runtime if 'check=True'
+        overall_error_message = e.stderr or str(e)
+        overall_passed_flag = False
+        execution_time = time.time() - start_time
+        logging.error(f"Docker process error for task {self.request.id}: {overall_error_message}")
+        return CodeExecutionResult(
+            status=overall_status,
+            overall_passed=overall_passed_flag,
+            output="",
+            error=overall_error_message,
+            execution_time=execution_time
+        ).dict()
+    except FileNotFoundError:
+        overall_status = "worker_error"
+        overall_error_message = "Docker or necessary command not found on worker."
+        overall_passed_flag = False
+        execution_time = time.time() - start_time
+        self.retry(exc=FileNotFoundError("Docker CLI not found."), countdown=5)
+        logging.error(f"Docker CLI not found for task {self.request.id}")
+        return CodeExecutionResult(
+            status=overall_status,
+            overall_passed=overall_passed_flag,
+            output="",
+            error=overall_error_message,
+            execution_time=execution_time
+        ).dict()
+    except Exception as e:
+        overall_status = "worker_error"
+        overall_error_message = f"An unhandled error occurred in worker: {str(e)}"
+        overall_passed_flag = False
+        execution_time = time.time() - start_time
+        logging.exception(f"Unhandled exception in worker for task {self.request.id}")
+        return CodeExecutionResult(
+            status=overall_status,
+            overall_passed=overall_passed_flag,
+            output="",
+            error=overall_error_message,
+            execution_time=execution_time
+        ).dict()
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            logging.info(f"Cleaned up temporary directory: {temp_dir}")
