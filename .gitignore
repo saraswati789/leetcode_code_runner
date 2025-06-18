@@ -1,0 +1,36 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python/
+
+# IDE specific files (e.g., VS Code)
+.vscode/
+.idea/
+
+# macOS specific files
+.DS_Store
+
+# Temporary files created by your application
+*.tmp
+*.temp
+*.swp
+tmp/
+*.log
+/var/folders/ # Temporary directories created by subprocess, etc.
+
+# Celery specific
+celerybeat.pid
+celeryworker.pid
+
+# Docker specific (if any local builds produce large files)
+*.dockerignore
+
+# Environment variables
+.env
