@@ -1,0 +1,37 @@
+# deployment-worker.yaml
+{{- if .Values.worker.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "my-celery-app.fullname" . }}-{{ .Values.worker.name }}
+  labels:
+    {{- include "my-celery-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ .Values.worker.name }}
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "my-celery-app.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: {{ .Values.worker.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "my-celery-app.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ .Values.worker.name }}
+    spec:
+      containers:
+      - name: {{ .Values.worker.name }}
+        image: "{{ include "my-celery-app.image" . }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: {{ .Values.worker.command }} # Celery worker command
+        envFrom:
+        - configMapRef:
+            name: {{ include "my-celery-app.fullname" . }}-config
+        {{- if .Values.redis.auth.enabled }}
+        - secretRef:
+            # CORRECTED LINE: Use our new helper for the secret name
+            name: {{ include "my-celery-app.redisSecretName" . }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.worker.resources | nindent 10 }}
+{{- end }}

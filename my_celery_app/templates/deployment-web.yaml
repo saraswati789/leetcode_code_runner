@@ -1,0 +1,56 @@
+# deployment-web.yaml
+{{- if .Values.web.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "my-celery-app.fullname" . }}-{{ .Values.web.name }}
+  labels:
+    {{- include "my-celery-app.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ .Values.web.name }}
+spec:
+  replicas: {{ .Values.web.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "my-celery-app.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: {{ .Values.web.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "my-celery-app.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ .Values.web.name }}
+    spec:
+      containers:
+      - name: {{ .Values.web.name }}
+        image: "{{ include "my-celery-app.image" . }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.web.port }}
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: {{ include "my-celery-app.fullname" . }}-config
+        {{- if .Values.redis.auth.enabled }}
+        - secretRef:
+            # CORRECTED LINE: Use our new helper for the secret name
+            name: {{ include "my-celery-app.redisSecretName" . }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.web.resources | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: / # Adjust to your app's health check endpoint if different
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: / # Adjust to your app's health check endpoint if different
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+{{- end }}

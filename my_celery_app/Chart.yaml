@@ -1,0 +1,13 @@
+# Chart.yaml
+apiVersion: v2
+name: my-celery-app
+description: A Helm chart for deploying a FastAPI app with Celery workers and Redis.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: redis
+    version: 18.x.x # Use a specific stable version, e.g., 18.1.0
+    repository: https://charts.bitnami.com/bitnami # Bitnami is a popular source for stable charts
+    condition: redis.enabled # Only deploy Redis if redis.enabled is true in values.yaml

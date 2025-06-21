@@ -1,0 +1,11 @@
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "my-celery-app.fullname" . }}-config
+  labels:
+    {{- include "my-celery-app.labels" . | nindent 4 }}
+data:
+  # Celery Broker URL (Redis)
+  CELERY_BROKER_URL: {{ include "my-celery-app.redisBrokerUrl" . | quote }}
+  CELERY_RESULT_BACKEND: {{ include "my-celery-app.redisBrokerUrl" . | quote }}

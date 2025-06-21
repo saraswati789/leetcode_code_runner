@@ -1,0 +1,96 @@
+# values.yaml
+global:
+  # Common labels for all resources in this chart
+  labels:
+    app.kubernetes.io/name: my-celery-app
+    app.kubernetes.io/instance: "{{ .Release.Name }}"
+    app.kubernetes.io/managed-by: "{{ .Release.Service }}"
+
+# --- Application Image Configuration ---
+image:
+  repository: my-celery-app # Replace with your Docker image name (e.g., your-docker-hub-username/my-celery-app)
+  tag: latest # Or a specific image tag (e.g., v1.0.0)
+  pullPolicy: IfNotPresent
+
+# --- Web Application (Uvicorn/FastAPI) Configuration ---
+web:
+  enabled: true
+  name: web
+  replicaCount: 1 # Initial replicas for the web app
+  port: 8000 # Port Uvicorn listens on
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+
+  hpa:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 80 # Target CPU utilization for auto-scaling
+
+  service:
+    type: ClusterIP # Or LoadBalancer for external IP
+    port: 80
+    targetPort: 8000 # Matches web.port
+
+  ingress:
+    enabled: false # Set to true to enable Ingress
+    className: nginx # Your Ingress controller class name (e.g., nginx, traefik)
+    annotations: {}
+      # kubernetes.io/ingress.class: nginx # Example for older Ingress API
+      # cert-manager.io/cluster-issuer: letsencrypt-prod # Example for cert-manager
+    host: chart-example.local # Replace with your domain
+    path: / # Base path for your application
+    pathType: Prefix
+    tls: []
+      # - secretName: chart-example-tls
+      #   hosts:
+      #     - chart-example.local
+
+# --- Celery Worker Configuration ---
+worker:
+  enabled: true
+  name: worker
+  replicaCount: 1 # Initial replicas for Celery workers
+  # Celery command to run. Ensure celery_worker.py is importable.
+  # The -A argument refers to the module containing your Celery app instance.
+  # If your Celery app instance is 'app' in 'celery_worker.py', then use 'celery_worker'.
+  command: ["celery", "-A", "celery_worker", "worker", "-l", "info", "--concurrency=4"]
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 200m
+      memory: 256Mi
+
+  hpa:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70 # Workers might need to scale faster or slower
+
+# --- Redis Configuration (sub-chart) ---
+redis:
+  enabled: true # Set to false if you use an external Redis instance
+  auth:
+    enabled: true # Enable password for Redis
+    password: "" # Helm will generate a random password if empty, or provide your own
+
+  master:
+    persistence:
+      enabled: true
+      size: 1Gi # Size of the PersistentVolumeClaim for Redis data
+    resources:
+      limits:
+        cpu: 200m
+        memory: 256Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi

@@ -24,3 +24,6 @@
       }
     ]
   }
+
+// celery -A celery_worker worker -l info --concurrency=4
+// uvicorn main:app --reload  
