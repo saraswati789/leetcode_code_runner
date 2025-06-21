@@ -1,0 +1,26 @@
+{
+    "language": "python",
+    "code": "s = input()\nprint(s[::-1])",
+    "test_cases": [
+      {
+        "input": "hello",
+        "expected_output": "olleh"
+      },
+      {
+        "input": "world",
+        "expected_output": "dlrow"
+      },
+      {
+        "input": "Python",
+        "expected_output": "nohtyP"
+      },
+      {
+        "input": "a",
+        "expected_output": "a"
+      },
+      {
+        "input": "",
+        "expected_output": ""
+      }
+    ]
+  }

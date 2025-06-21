@@ -5,7 +5,7 @@ import os
 import shutil
 import time
 from celery import Celery
-from typing import Dict, Any, Optional, List # Added List
+from typing import Dict, Any, Optional, List
 import logging
 from pydantic import BaseModel
 
@@ -26,36 +26,32 @@ celery_app.conf.update(
     task_time_limit=30, # Increased timeout for more complex code/multiple test cases
     task_soft_time_limit=25,
     broker_connection_retry_on_startup=True,
-    # Configure serializer to support Pydantic model serialization if needed,
-    # but dicts are usually fine.
-    # task_serializer='json',
-    # result_serializer='json',
-    # accept_content=['json'],
 )
 
 # Language-specific Docker image and command configurations
-# Make sure these images are available or can be pulled by your Docker daemon
+# For Python, the command needs to be the actual interpreter call inside the container.
+# We will use 'bash -c "echo ... | python main.py"' to handle input.
 LANGUAGE_CONFIGS = {
     "python": {
         "image": "python:3.9-slim-buster",
-        "command": ["python", "main.py"],
+        # The command for running the script within the container
+        # We will dynamically build the full docker run command later
+        "executable": ["python", "/app/main.py"], # <-- Changed from 'command' to 'executable'
         "filename": "main.py"
     },
     # "java": {
     #     "image": "openjdk:17-jdk-slim",
-    #     "command": ["java", "Main"],
+    #     "executable": ["java", "Main"],
     #     "filename": "Main.java"
     # },
     # "cpp": {
     #     "image": "gcc:latest",
-    #     "command": ["bash", "-c", "g++ main.cpp -o main && ./main"],
+    #     "executable": ["bash", "-c", "g++ main.cpp -o main && ./main"], # Example for C++ build/run
     #     "filename": "main.cpp"
     # }
 }
 
 # --- Re-defining the Pydantic models needed by the worker ---
-# It's good practice to have these models available where they are consumed/produced
-# In a larger project, these would be in a shared 'models.py' file.
 class TestCase(BaseModel):
     input: str
     expected_output: str
@@ -71,13 +67,13 @@ class TestCaseResult(BaseModel):
 class CodeExecutionResult(BaseModel):
     status: str # "success", "compilation_error", "runtime_error", "timeout", "worker_error"
     overall_passed: Optional[bool] = None
-    output: Optional[str] = None # Overall output (e.g., for simple prints without test cases) or aggregated errors
-    error: Optional[str] = None # Overall error (e.g., compilation error, general worker error)
+    output: Optional[str] = None
+    error: Optional[str] = None
     execution_time: Optional[float] = None
     test_results: Optional[List[TestCaseResult]] = None
 
 
-@celery_app.task(bind=True, default_retry_delay=5, max_retries=3) # Bind=True to access self for retry
+@celery_app.task(bind=True, default_retry_delay=5, max_retries=3)
 def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List[Dict[str, str]]] = None):
     """
     Executes user code in a Docker container with provided test cases.
@@ -105,32 +101,34 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
             f.write(code)
 
         docker_image = config["image"]
-        base_docker_command = [
+
+        # Base Docker command prefix for all runs
+        base_docker_run_prefix = [
             "docker", "run", "--rm",
             "-v", f"{temp_dir}:/app", # Mount the temp directory
             "-w", "/app",             # Set working directory inside container
             docker_image
-        ] + config["command"]
+        ]
 
         # If no specific test cases provided, run once without stdin, capture stdout/stderr
         if not test_cases:
             try:
                 logging.info(f"Running code without specific test cases for {language}...")
                 process = subprocess.run(
-                    base_docker_command,
+                    base_docker_run_prefix + config["executable"], # Use 'executable' here
                     capture_output=True,
-                    text=True,
-                    check=False, # Do not raise CalledProcessError automatically
-                    timeout=celery_app.conf.task_time_limit # Use Celery's task timeout
+                    text=True, # Keep text=True for this branch as no stdin is used via `input` arg
+                    check=False,
+                    timeout=celery_app.conf.task_time_limit
                 )
                 actual_output = process.stdout.strip()
                 error_output = process.stderr.strip()
 
                 if process.returncode != 0:
-                    overall_status = "runtime_error" if process.returncode else "compilation_error"
+                    overall_status = "runtime_error"
                     overall_error_message = error_output if error_output else f"Process exited with non-zero code {process.returncode}."
                     overall_passed_flag = False
-                elif error_output: # Warnings or other stderr output not causing exit code
+                elif error_output:
                     overall_error_message = error_output
 
                 execution_time = time.time() - start_time
@@ -140,19 +138,15 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
                     output=actual_output,
                     error=overall_error_message,
                     execution_time=execution_time,
-                    test_results=[] # No test results for this mode
+                    test_results=[]
                 ).dict()
 
             except subprocess.TimeoutExpired:
                 overall_status = "timeout"
                 overall_error_message = "Code execution timed out."
                 overall_passed_flag = False
-                # Try to kill the process if it's still running
                 if process.poll() is None:
                     process.kill()
-                # Retry the task if it timed out - this is where bind=True and self.retry() come in
-                # self.retry(exc=subprocess.TimeoutExpired("Code execution timed out."), countdown=5)
-                # For now, just return a result, but retrying is a valid strategy
                 execution_time = time.time() - start_time
                 return CodeExecutionResult(
                     status=overall_status,
@@ -178,19 +172,29 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
         # --- Execute with Test Cases ---
         logging.info(f"Running code with {len(test_cases)} test cases for {language}...")
         for i, test_case_dict in enumerate(test_cases):
-            test_case = TestCase(**test_case_dict) # Convert dict to Pydantic model for type safety
+            test_case = TestCase(**test_case_dict)
             test_case_number = i + 1
             passed = False
             test_case_error = None
 
+            # Construct the command that pipes input using 'echo -e'
+            # 'echo -e' interprets backslash escapes like '\n'
+            # We need to properly escape the input string to be safe within the shell command
+            escaped_input = test_case.input.replace('\\', '\\\\').replace('"', '\\"') # Escape backslashes and double quotes
+            # Ensure a newline is always at the end of the piped input
+            full_shell_command = f"echo -e \"{escaped_input}\\n\" | {' '.join(config['executable'])}"
+
+            # The docker command now runs 'bash -c' with the full shell command
+            docker_command_with_input = base_docker_run_prefix + ["bash", "-c", full_shell_command]
+
             try:
+                logging.info(f"Executing test case {test_case_number}: {' '.join(docker_command_with_input)}")
                 process = subprocess.run(
-                    base_docker_command,
-                    input=test_case.input + '\n',
+                    docker_command_with_input,
                     capture_output=True,
-                    text=True,
+                    text=True, # text=True is fine here because input is handled by echo -e, not subprocess's input arg
                     check=False,
-                    timeout=celery_app.conf.task_time_limit # Use Celery's task timeout
+                    timeout=celery_app.conf.task_time_limit
                 )
 
                 actual_output = process.stdout.strip()
@@ -198,13 +202,11 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
 
                 if process.returncode != 0:
                     test_case_error = error_output if error_output else f"Runtime error: exited with code {process.returncode}"
-                    overall_status = "runtime_error" # Update overall status if any test case fails due to runtime
+                    overall_status = "runtime_error"
                     overall_passed_flag = False
                 elif error_output:
-                    # Capture stderr even if return code is 0 (e.g., warnings or Python tracebacks)
                     test_case_error = error_output
-                    # If stderr is present, it's typically a failure for a judge
-                    overall_status = "runtime_error" # Treat stderr as a failure for overall status
+                    overall_status = "runtime_error"
                     overall_passed_flag = False
 
                 # Compare output, ignoring leading/trailing whitespace and ensuring consistent line endings
@@ -212,12 +214,12 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
                     passed = True
                 else:
                     passed = False
-                    overall_passed_flag = False # If any test case fails, overall fails
+                    overall_passed_flag = False
 
                 all_test_results.append(
                     TestCaseResult(
                         test_case_number=test_case_number,
-                        input=test_case.input + '\n',
+                        input=test_case.input, # Store original input without added newline
                         expected_output=test_case.expected_output,
                         actual_output=actual_output,
                         passed=passed,
@@ -230,7 +232,7 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
                 all_test_results.append(
                     TestCaseResult(
                         test_case_number=test_case_number,
-                        input=test_case.input + '\n',
+                        input=test_case.input,
                         expected_output=test_case.expected_output,
                         actual_output="",
                         passed=False,
@@ -239,15 +241,13 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
                 )
                 overall_status = "timeout"
                 overall_passed_flag = False
-                # Continue processing other test cases or raise/retry?
-                # For now, we collect all results and report overall timeout if any occurred.
                 logging.warning(f"Timeout on test case {test_case_number} for task {self.request.id}")
             except Exception as e:
                 test_case_error = f"Worker error during test case {test_case_number}: {str(e)}"
                 all_test_results.append(
                     TestCaseResult(
                         test_case_number=test_case_number,
-                        input=test_case.input + '\n',
+                        input=test_case.input,
                         expected_output=test_case.expected_output,
                         actual_output="",
                         passed=False,
@@ -257,25 +257,23 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
                 overall_status = "worker_error"
                 overall_passed_flag = False
                 logging.exception(f"Unhandled error on test case {test_case_number} for task {self.request.id}")
-                # Don't re-raise immediately, collect results and return.
 
         execution_time = time.time() - start_time
 
-        # Determine final overall status
         if overall_status == "success" and not overall_passed_flag:
-            overall_status = "failure" # This can happen if all test cases ran but some failed comparisons
+            overall_status = "failure"
 
         return CodeExecutionResult(
             status=overall_status,
             overall_passed=overall_passed_flag,
-            output="\n".join([r.actual_output for r in all_test_results]), # Aggregate all outputs
-            error=overall_error_message, # Use the first overall error or aggregate
+            output="\n".join([r.actual_output for r in all_test_results]) if all_test_results else "",
+            error=overall_error_message,
             execution_time=execution_time,
             test_results=all_test_results
-        ).dict() # Convert Pydantic model to dict for Celery result backend
+        ).dict()
 
     except subprocess.CalledProcessError as e:
-        overall_status = "compilation_error" # Or sometimes runtime if 'check=True'
+        overall_status = "compilation_error"
         overall_error_message = e.stderr or str(e)
         overall_passed_flag = False
         execution_time = time.time() - start_time
@@ -318,3 +316,7 @@ def run_code_in_docker(self, language: str, code: str, test_cases: Optional[List
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
             logging.info(f"Cleaned up temporary directory: {temp_dir}")
+
+# This ensures the Celery app is available for the worker to discover tasks
+if __name__ == '__main__':
+    celery_app.worker_main(['worker', '-l', 'info', '--concurrency=1'])
